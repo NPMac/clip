@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Clipboard</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; min-height: 120px; font: inherit; padding: .5rem; box-sizing: border-box; }
+  input { font: inherit; padding: .5rem; width: 260px; }
+  button { font: inherit; padding: .4rem .8rem; cursor: pointer; }
+  .row { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; }
+  .clip { border: 1px solid #ddd; border-radius: 6px; padding: .6rem; margin: .6rem 0; }
+  .clip pre { white-space: pre-wrap; word-break: break-word; margin: 0 0 .5rem; max-height: 200px; overflow: auto; }
+  .meta { color: #888; font-size: .8rem; }
+  .hidden { display: none; }
+  #msg { color: #c00; }
+</style>
+</head>
+<body>
+  <h2>Clipboard</h2>
+  <p id="msg"></p>
+
+  <div id="login">
+    <div class="row">
+      <input id="keyInput" type="password" placeholder="Shared key" />
+      <button id="loginBtn">Unlock</button>
+    </div>
+  </div>
+
+  <div id="app" class="hidden">
+    <textarea id="text" placeholder="Paste text here (Ctrl+Enter to save)"></textarea>
+    <div class="row">
+      <button id="saveBtn">Save</button>
+      <button id="pasteBtn">Paste from clipboard &amp; save</button>
+      <button id="refreshBtn">Refresh</button>
+      <button id="logoutBtn">Lock</button>
+    </div>
+    <div id="list"></div>
+  </div>
+
+<script>
+  const SUPABASE_URL = 'https://wtdfjfvjpczaffzjicpj.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_KZDb1BR4p6RRcUpzeQTdrg_-lQYdCgC';
+  const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+  const $ = id => document.getElementById(id);
+  let key = localStorage.getItem('clipKey');
+
+  const showMsg = t => { $('msg').textContent = t || ''; };
+
+  async function load() {
+    const { data, error } = await db.rpc('list_clips', { p_key: key });
+    if (error) { showMsg(error.message); lock(); return false; }
+    showMsg('');
+    render(data);
+    return true;
+  }
+
+  function render(clips) {
+    const list = $('list');
+    list.innerHTML = '';
+    for (const c of clips) {
+      const div = document.createElement('div');
+      div.className = 'clip';
+      const pre = document.createElement('pre');
+      pre.textContent = c.content;               // safe: no HTML injection
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = new Date(c.created_at).toLocaleString();
+      const row = document.createElement('div');
+      row.className = 'row';
+      const copy = document.createElement('button');
+      copy.textContent = 'Copy';
+      copy.onclick = async () => {
+        await copyText(c.content);
+        copy.textContent = 'Copied!';
+        setTimeout(() => copy.textContent = 'Copy', 1200);
+      };
+      const del = document.createElement('button');
+      del.textContent = 'Delete';
+      del.onclick = async () => {
+        const { error } = await db.rpc('delete_clip', { p_key: key, p_id: c.id });
+        if (error) showMsg(error.message); else load();
+      };
+      row.append(copy, del);
+      div.append(pre, row, meta);
+      list.append(div);
+    }
+  }
+
+  async function copyText(t) {
+    try { await navigator.clipboard.writeText(t); }
+    catch {                                       // fallback for non-https
+      const ta = document.createElement('textarea');
+      ta.value = t; document.body.append(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+    }
+  }
+
+  async function save(content) {
+    if (!content.trim()) return;
+    const { error } = await db.rpc('add_clip', { p_key: key, p_content: content });
+    if (error) { showMsg(error.message); return; }
+    $('text').value = '';
+    load();
+  }
+
+  function lock() {
+    key = null;
+    localStorage.removeItem('clipKey');
+    $('app').classList.add('hidden');
+    $('login').classList.remove('hidden');
+  }
+
+  async function unlock(k) {
+    key = k;
+    if (await load()) {
+      localStorage.setItem('clipKey', key);
+      $('login').classList.add('hidden');
+      $('app').classList.remove('hidden');
+    }
+  }
+
+  $('loginBtn').onclick = () => unlock($('keyInput').value);
+  $('keyInput').onkeydown = e => { if (e.key === 'Enter') unlock($('keyInput').value); };
+  $('saveBtn').onclick = () => save($('text').value);
+  $('text').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) save($('text').value); };
+  $('pasteBtn').onclick = async () => {
+    try { save(await navigator.clipboard.readText()); }
+    catch { showMsg('Clipboard read blocked; paste into the box instead.'); }
+  };
+  $('refreshBtn').onclick = load;
+  $('logoutBtn').onclick = lock;
+
+  if (key) unlock(key);
+</script>
+</body>
+</html>
