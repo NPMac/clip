@@ -3,30 +3,56 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://wtdfjfvjpczaffzjicpj.supabase.co; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
 <title>Clipboard</title>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
+  :root { color-scheme: light dark; }
   body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
   textarea { width: 100%; min-height: 120px; font: inherit; padding: .5rem; box-sizing: border-box; }
-  input { font: inherit; padding: .5rem; width: 260px; }
+  input, select { font: inherit; padding: .5rem; }
+  input[type=text], input[type=password] { width: 260px; max-width: 100%; }
   button { font: inherit; padding: .4rem .8rem; cursor: pointer; }
-  .row { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; }
-  .clip { border: 1px solid #ddd; border-radius: 6px; padding: .6rem; margin: .6rem 0; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .row { display: flex; gap: .5rem; margin: .5rem 0; flex-wrap: wrap; align-items: center; }
+  .clip { border: 1px solid #8884; border-radius: 6px; padding: .6rem; margin: .6rem 0; }
   .clip pre { white-space: pre-wrap; word-break: break-word; margin: 0 0 .5rem; max-height: 200px; overflow: auto; }
   .meta { color: #888; font-size: .8rem; }
-  .hidden { display: none; }
-  #msg { color: #c00; }
+  .bad { color: #c00; font-style: italic; }
+  .hidden { display: none !important; }
+  .spacer { flex: 1; }
+  #msg { color: #c00; min-height: 1.2em; }
+  a.btn { font: inherit; font-size: .9em; padding: .4rem .8rem; border: 1px solid #8888; border-radius: 4px; text-decoration: none; color: inherit; }
 </style>
 </head>
 <body>
-  <h2>Clipboard</h2>
+  <div class="row" style="margin:0">
+    <h2 style="margin:.5rem 0">Clipboard</h2>
+    <span class="spacer"></span>
+    <span id="account" class="hidden">
+      Logged in as <b id="who"></b>
+      <button id="logoutBtn" title="Forget the key on this device and go back to the login screen">Log out</button>
+    </span>
+  </div>
   <p id="msg"></p>
 
   <div id="login">
+    <div class="row"><input id="user" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" spellcheck="false" /></div>
     <div class="row">
-      <input id="keyInput" type="password" placeholder="Shared key" />
+      <input id="pass" type="password" placeholder="Passphrase" autocomplete="current-password" spellcheck="false" />
+      <button id="showBtn" type="button" title="Show / hide">Show</button>
+      <button id="genBtn" type="button" title="Generate a strong passphrase (offline, in this browser)">Generate</button>
+    </div>
+    <div class="row">
+      <label><input id="remember" type="checkbox" checked /> Remember on this device</label>
+    </div>
+    <div class="row">
       <button id="loginBtn">Unlock</button>
     </div>
+    <p class="meta">Username + passphrase together open your clipboard and encrypt it.
+      Neither is sent to the server. Any new combination is a new, empty clipboard;
+      if you lose either, your clips cannot be recovered by anyone.</p>
   </div>
 
   <div id="app" class="hidden">
@@ -34,107 +60,343 @@
     <div class="row">
       <button id="saveBtn">Save</button>
       <button id="pasteBtn">Paste from clipboard &amp; save</button>
+      <label>Expires in
+        <select id="ttl">
+          <option value="300">5 min</option>
+          <option value="3600">1 hour</option>
+          <option value="86400">1 day</option>
+          <option value="604800" selected>7 days</option>
+        </select>
+      </label>
+      <span class="spacer"></span>
       <button id="refreshBtn">Refresh</button>
-      <button id="logoutBtn">Lock</button>
     </div>
     <div id="list"></div>
+    <div class="row" style="margin-top:2rem">
+      <a id="cliLink" class="btn" href="clip.py" download="clip.py" title="Command-line client, Python 3.8+, no dependencies">Download CLI (clip.py)</a>
+      <span class="spacer"></span>
+      <button id="clearBtn">Delete all clips</button>
+    </div>
+    <pre id="cliHelp" class="meta hidden" style="white-space:pre-wrap"></pre>
   </div>
 
+
+  <p class="meta" style="margin-top:2rem"><a href="README.md" target="_blank" rel="noopener">README</a> · how it works, setup, CLI</p>
 <script>
-  const SUPABASE_URL = 'https://wtdfjfvjpczaffzjicpj.supabase.co';
-  const SUPABASE_KEY = 'sb_publishable_KZDb1BR4p6RRcUpzeQTdrg_-lQYdCgC';
-  const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+'use strict';
+const SUPABASE_URL = 'https://wtdfjfvjpczaffzjicpj.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_KZDb1BR4p6RRcUpzeQTdrg_-lQYdCgC';
+const KDF_ITER = 600000;          // PBKDF2-SHA256 (OWASP 2023+ recommendation)
+const MAX_CT = 200000;            // must match the DB check constraint
 
-  const $ = id => document.getElementById(id);
-  let key = localStorage.getItem('clipKey');
+const te = new TextEncoder(), td = new TextDecoder();
+const $ = id => document.getElementById(id);
+const showMsg = t => { $('msg').textContent = t || ''; };
 
-  const showMsg = t => { $('msg').textContent = t || ''; };
+let S = null;        // session: { user, token, aesKey }  (aesKey is non-extractable)
+let rows = [];       // [{ clip, div, meta }]
 
-  async function load() {
-    const { data, error } = await db.rpc('list_clips', { p_key: key });
-    if (error) { showMsg(error.message); lock(); return false; }
-    showMsg('');
-    render(data);
+// ---------- encoding ----------
+const toB64 = b => { let s = ''; for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(s); };
+const fromB64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+
+// ---------- crypto ----------
+// passphrase --PBKDF2(salt=username)--> master --HKDF--> { AES-GCM key, auth token }
+// Only sha256(auth token) is stored on the server; the AES key never leaves the browser.
+async function deriveSession(user, pass) {
+  const pw = await crypto.subtle.importKey('raw', te.encode(pass), 'PBKDF2', false, ['deriveBits']);
+  const master = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt: te.encode('clipboard/v2/' + user), iterations: KDF_ITER }, pw, 256);
+  const hk = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveBits', 'deriveKey']);
+  const hkdf = info => ({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: te.encode(info) });
+  const aesKey = await crypto.subtle.deriveKey(hkdf('enc'), hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  const token = toB64(new Uint8Array(await crypto.subtle.deriveBits(hkdf('auth'), hk, 256)));
+  return { user, token, aesKey };
+}
+
+// Plaintext is padded to a multiple of PAD bytes so the server only learns a coarse size.
+// Layout before encryption: [4-byte big-endian length][UTF-8 text][zero padding]
+const PAD = 512;
+
+async function encrypt(text) {
+  const data = te.encode(text);
+  const buf = new Uint8Array(Math.ceil((data.length + 4) / PAD) * PAD);
+  new DataView(buf.buffer).setUint32(0, data.length);
+  buf.set(data, 4);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, S.aesKey, buf);
+  return 'v2.' + toB64(iv) + '.' + toB64(new Uint8Array(ct));
+}
+
+async function decrypt(blob) {
+  const [v, iv, ct] = blob.split('.');
+  if (v !== 'v2') throw new Error('unknown format');
+  const buf = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(iv) }, S.aesKey, fromB64(ct)));
+  const n = new DataView(buf.buffer).getUint32(0);
+  if (n > buf.length - 4) throw new Error('bad padding');
+  return td.decode(buf.subarray(4, 4 + n));
+}
+
+// ---------- "remember me": session in IndexedDB (key stays non-extractable) ----------
+function idb(mode, fn) {
+  return new Promise((res, rej) => {
+    const open = indexedDB.open('clipboard2', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('kv');
+    open.onerror = () => rej(open.error);
+    open.onsuccess = () => {
+      const tx = open.result.transaction('kv', mode);
+      const req = fn(tx.objectStore('kv'));
+      tx.oncomplete = () => { open.result.close(); res(req.result); };
+      tx.onerror = () => rej(tx.error);
+    };
+  });
+}
+const saveSession  = s => idb('readwrite', st => st.put(s, 'session'));
+const loadSession  = () => idb('readonly',  st => st.get('session'));
+const clearSession = () => idb('readwrite', st => st.delete('session'));
+
+// ---------- API (plain fetch to PostgREST, no third-party script) ----------
+async function rpc(fn, args) {
+  const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(args),
+  });
+  const text = await r.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (!r.ok) {
+    const err = new Error((body && body.message) || `HTTP ${r.status}`);
+    err.code = body && body.code;
+    throw err;
+  }
+  return body;
+}
+const auth = () => ({ p_token: S.token });
+
+const api = (fn, args) => rpc(fn, { ...auth(), ...args });
+
+const handleErr = e => showMsg((e && e.message) || String(e));
+
+// ---------- UI ----------
+function busy(on, text) {
+  for (const b of document.querySelectorAll('button')) b.disabled = on;
+  if (on) showMsg(text || '');
+}
+
+function fmtLeft(ms) {
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return '<1 min';
+  if (m < 60) return m + ' min';
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + ' h';
+  return Math.floor(h / 24) + ' d';
+}
+
+async function load(data) {
+  if (!data) data = await api('clip2_list');
+  const clips = await Promise.all(data.map(async c => {
+    let text = null;
+    try { text = await decrypt(c.content); } catch {}
+    return { ...c, text };
+  }));
+  render(clips);
+}
+
+function render(clips) {
+  const list = $('list');
+  list.innerHTML = '';
+  rows = [];
+  if (!clips.length) {
+    const p = document.createElement('p');
+    p.className = 'meta';
+    p.textContent = 'No clips for this username + passphrase. Expected some? Log out and check both for typos.';
+    list.append(p);
+  }
+  for (const c of clips) {
+    const div = document.createElement('div');
+    div.className = 'clip';
+    const pre = document.createElement('pre');
+    if (c.text === null) { pre.textContent = '[cannot decrypt]'; pre.className = 'bad'; }
+    else pre.textContent = c.text;
+    const row = document.createElement('div');
+    row.className = 'row';
+    const copy = document.createElement('button');
+    copy.textContent = 'Copy';
+    copy.disabled = c.text === null;
+    copy.onclick = async () => {
+      await copyText(c.text);
+      copy.textContent = 'Copied!';
+      setTimeout(() => copy.textContent = 'Copy', 1200);
+    };
+    const del = document.createElement('button');
+    del.textContent = 'Delete';
+    del.onclick = async () => {
+      try { await api('clip2_delete', { p_id: c.id }); div.remove(); rows = rows.filter(r => r.div !== div); }
+      catch (e) { handleErr(e); }
+    };
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    row.append(copy, del);
+    div.append(pre, row, meta);
+    list.append(div);
+    rows.push({ clip: c, div, meta });
+  }
+  tick();
+}
+
+// Update countdowns and hide expired clips without hitting the server.
+function tick() {
+  const now = Date.now();
+  rows = rows.filter(r => {
+    const left = new Date(r.clip.expires_at) - now;
+    if (left <= 0) { r.div.remove(); return false; }
+    r.meta.textContent = `${new Date(r.clip.created_at).toLocaleString()} · expires in ${fmtLeft(left)}`;
     return true;
-  }
+  });
+}
+setInterval(tick, 30000);
 
-  function render(clips) {
-    const list = $('list');
-    list.innerHTML = '';
-    for (const c of clips) {
-      const div = document.createElement('div');
-      div.className = 'clip';
-      const pre = document.createElement('pre');
-      pre.textContent = c.content;               // safe: no HTML injection
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      meta.textContent = new Date(c.created_at).toLocaleString();
-      const row = document.createElement('div');
-      row.className = 'row';
-      const copy = document.createElement('button');
-      copy.textContent = 'Copy';
-      copy.onclick = async () => {
-        await copyText(c.content);
-        copy.textContent = 'Copied!';
-        setTimeout(() => copy.textContent = 'Copy', 1200);
-      };
-      const del = document.createElement('button');
-      del.textContent = 'Delete';
-      del.onclick = async () => {
-        const { error } = await db.rpc('delete_clip', { p_key: key, p_id: c.id });
-        if (error) showMsg(error.message); else load();
-      };
-      row.append(copy, del);
-      div.append(pre, row, meta);
-      list.append(div);
-    }
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); }
+  catch {                                        // fallback for non-https
+    const ta = document.createElement('textarea');
+    ta.value = t; document.body.append(ta); ta.select();
+    document.execCommand('copy'); ta.remove();
   }
+}
 
-  async function copyText(t) {
-    try { await navigator.clipboard.writeText(t); }
-    catch {                                       // fallback for non-https
-      const ta = document.createElement('textarea');
-      ta.value = t; document.body.append(ta); ta.select();
-      document.execCommand('copy'); ta.remove();
-    }
-  }
-
-  async function save(content) {
-    if (!content.trim()) return;
-    const { error } = await db.rpc('add_clip', { p_key: key, p_content: content });
-    if (error) { showMsg(error.message); return; }
+async function save(content) {
+  if (!content.trim()) return;
+  busy(true, 'Saving…');
+  try {
+    const ct = await encrypt(content);
+    if (ct.length > MAX_CT) throw new Error('Too large (max ≈ 145 KB of text).');
+    await api('clip2_add', { p_content: ct, p_ttl_seconds: +$('ttl').value });
     $('text').value = '';
-    load();
-  }
+    await load();
+    showMsg('');
+  } catch (e) { handleErr(e); }
+  finally { busy(false); }
+}
 
-  function lock() {
-    key = null;
-    localStorage.removeItem('clipKey');
-    $('app').classList.add('hidden');
-    $('login').classList.remove('hidden');
-  }
+function showApp() {
+  $('who').textContent = S.user;
+  $('account').classList.remove('hidden');
+  $('login').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  $('text').focus();
+}
 
-  async function unlock(k) {
-    key = k;
-    if (await load()) {
-      localStorage.setItem('clipKey', key);
-      $('login').classList.add('hidden');
-      $('app').classList.remove('hidden');
-    }
-  }
+async function lock() {
+  S = null; rows = [];
+  $('list').innerHTML = '';
+  $('who').textContent = '';
+  $('account').classList.add('hidden');
+  $('user').value = '';
+  $('cliHelp').classList.add('hidden');
+  try { await clearSession(); } catch {}
+  $('app').classList.add('hidden');
+  $('login').classList.remove('hidden');
+  $('user').focus();
+}
 
-  $('loginBtn').onclick = () => unlock($('keyInput').value);
-  $('keyInput').onkeydown = e => { if (e.key === 'Enter') unlock($('keyInput').value); };
-  $('saveBtn').onclick = () => save($('text').value);
-  $('text').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) save($('text').value); };
-  $('pasteBtn').onclick = async () => {
-    try { save(await navigator.clipboard.readText()); }
-    catch { showMsg('Clipboard read blocked; paste into the box instead.'); }
-  };
-  $('refreshBtn').onclick = load;
-  $('logoutBtn').onclick = lock;
+// ---------- passphrase generator (offline: crypto.getRandomValues only) ----------
+// 32-symbol alphabet without look-alikes (no i, l, o, 1) → 5 bits/char, unbiased.
+// 5 groups × 5 chars = 125 bits, e.g. "k7m3p-9xqa2-…".
+const GEN_ALPHABET = 'abcdefghjkmnpqrstuvwxyz023456789';
+function generatePassphrase(groups = 5, size = 5) {
+  const bytes = crypto.getRandomValues(new Uint8Array(groups * size));
+  const chars = Array.from(bytes, b => GEN_ALPHABET[b & 31]);
+  const out = [];
+  for (let i = 0; i < chars.length; i += size) out.push(chars.slice(i, i + size).join(''));
+  return out.join('-');
+}
 
-  if (key) unlock(key);
+function showPass(on) {
+  $('pass').type = on ? 'text' : 'password';
+  $('showBtn').textContent = on ? 'Hide' : 'Show';
+}
+
+// No accounts: username + passphrase derive the token, and the token's clips are listed.
+// A new combination just shows an empty clipboard.
+async function unlock() {
+  const user = $('user').value.trim().toLowerCase();
+  const pass = $('pass').value;
+  if (!/^[a-z0-9_.-]{3,32}$/.test(user)) return showMsg('Username: 3–32 characters, a–z 0–9 _ . -');
+  if (!pass) return showMsg('Enter your passphrase.');
+
+  busy(true, 'Deriving key…');
+  try {
+    S = await deriveSession(user, pass);
+    await load();
+    if ($('remember').checked) { try { await saveSession(S); } catch {} }
+    $('pass').value = '';
+    showPass(false);
+    showMsg('');
+    showApp();
+  } catch (e) { S = null; showMsg(e.message); }
+  finally { busy(false); }
+}
+
+// ---------- wiring ----------
+$('loginBtn').onclick = unlock;
+for (const id of ['user', 'pass'])
+  $(id).onkeydown = e => { if (e.key === 'Enter') unlock(); };
+$('showBtn').onclick = () => showPass($('pass').type === 'password');
+$('genBtn').onclick = async () => {
+  const p = generatePassphrase();
+  $('pass').value = p;
+  $('pass').autocomplete = 'new-password';         // lets password managers offer to save it
+  showPass(true);
+  let copied = false;
+  try { await navigator.clipboard.writeText(p); copied = true; } catch {}
+  showMsg((copied ? 'Generated and copied. ' : 'Generated. ') +
+          'Save it in your password manager now — it cannot be recovered.');
+};
+$('saveBtn').onclick = () => save($('text').value);
+$('text').onkeydown = e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) save($('text').value); };
+$('pasteBtn').onclick = async () => {
+  try { save(await navigator.clipboard.readText()); }
+  catch { showMsg('Clipboard read blocked; paste into the box instead.'); }
+};
+$('refreshBtn').onclick = () => load().catch(handleErr);
+$('logoutBtn').onclick = lock;
+// Plain link: the browser downloads clip.py from the server next to this page.
+$('cliLink').onclick = () => {
+  $('cliHelp').textContent =
+`Same clipboard and encryption as this page. Python 3.8+, no extra packages.
+"-" asks for the passphrase instead of taking it as an argument.
+
+  python3 clip.py ${S.user} - list
+  python3 clip.py ${S.user} - last | pbcopy        # or xclip / clip.exe
+  echo hello | python3 clip.py ${S.user} - add --ttl 1h
+  python3 clip.py ${S.user} - get ID
+  python3 clip.py ${S.user} - rm ID`;
+  $('cliHelp').classList.remove('hidden');
+};
+$('clearBtn').onclick = async () => {
+  if (prompt(`Type "${S.user}" to permanently delete ALL clips in this clipboard:`) !== S.user) return;
+  try { const n = await api('clip2_delete_all'); await load(); showMsg(`Deleted ${n} clip(s).`); }
+  catch (e) { handleErr(e); }
+};
+
+// TTL choice is not sensitive; remember it.
+try { const t = localStorage.getItem('clip2Ttl'); if (t) $('ttl').value = t; } catch {}
+$('ttl').onchange = () => { try { localStorage.setItem('clip2Ttl', $('ttl').value); } catch {} };
+
+// Re-sync when the tab comes back into focus (e.g. after copying on another device).
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S) load().catch(handleErr);
+});
+
+// ---------- startup ----------
+(async () => {
+  try {
+    const s = await loadSession();
+    if (s && s.aesKey) { S = s; await load(); showApp(); }
+  } catch (e) { S = null; handleErr(e); }
+})();
 </script>
 </body>
 </html>
